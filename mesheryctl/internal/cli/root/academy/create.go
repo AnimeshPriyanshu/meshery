@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	mesheryctlflags "github.com/meshery/meshery/mesheryctl/internal/cli/pkg/flags"
+	"github.com/meshery/meshery/mesheryctl/pkg/utils"
 	academyModel "github.com/meshery/schemas/models/v1beta3/academy"
 	"github.com/spf13/cobra"
 )
@@ -20,6 +21,7 @@ type cmdAcademyCreateFlags struct {
 	Category    string `json:"category"`
 	Tags        string `json:"tags"`
 	Force       bool   `json:"force"`
+	DryRun      bool   `json:"dryRun"`
 	ID          string `json:"id"`
 	Banner      string `json:"banner"`
 	Draft       bool   `json:"draft"`
@@ -32,7 +34,8 @@ var createCmd = &cobra.Command{
 	Short: "Scaffold Layer5 Academy content",
 	Long: `Create scaffolding for Layer5 Academy content types such as learning paths, courses, modules, and pages.
 For 'learning-path', it creates a full starter tree.
-For others, it adds a single node into an existing tree at the path specified by '--into'.`,
+For others, it adds a single node into an existing tree at the path specified by '--into'.
+Use '--dry-run' to preview everything the command would do without touching the filesystem.`,
 	Example: `
 // Scaffold a full learning path tree (root type via --type flag)
 mesheryctl exp academy create --type learning-path --title "My Path" --description "Desc" --level beginner --org 123e4567-e89b-12d3-a456-426614174000
@@ -42,8 +45,19 @@ mesheryctl exp academy create course "New Course" --description "Desc" --into ./
 
 // Scaffold a challenge
 mesheryctl exp academy create --type challenge --title "My Challenge" --description "Desc" --org 123e4567-e89b-12d3-a456-426614174000
+
+// Preview a scaffold without writing anything
+mesheryctl exp academy create learning-path --title "Kubernetes Basics" --org 123e4567-e89b-12d3-a456-426614174000 --dry-run
 `,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
+		// Accept the positional form `create <root-type>` as sugar for
+		// `create --type <root-type>` (e.g. `academy create learning-path
+		// --title ... --dry-run`). Root types are not registered subcommands,
+		// so their name arrives here as a positional arg. Explicit --type
+		// always wins, and structural types keep their subcommand form.
+		if createAcademyFlags.Type == "" && len(args) > 0 && isRootType(args[0]) {
+			createAcademyFlags.Type = args[0]
+		}
 		return mesheryctlflags.ValidateCmdFlags(cmd, &createAcademyFlags)
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -115,22 +129,57 @@ func executeCreate() error {
 		Tags:        tagsList,
 		TargetDir:   targetDir,
 		Force:       createAcademyFlags.Force,
+		DryRun:      createAcademyFlags.DryRun,
 		ID:          createAcademyFlags.ID,
 		Banner:      createAcademyFlags.Banner,
 		Draft:       createAcademyFlags.Draft,
+	}
+
+	if createAcademyFlags.DryRun {
+		return executeDryRun(opts)
 	}
 
 	// Root types (learning-path, certification) scaffold a full starter tree; challenge
 	// has its own lab/exam/content shape. Structural nodes (course, module, page, etc.)
 	// add a single node into the existing tree at --into.
 	if cType == academyModel.Challenge {
-		return scaffoldChallenge(opts)
+		return scaffold(realScaffoldView{}, opts)
 	}
 	if isRootType(string(cType)) {
-		return scaffoldTree(opts)
+		return scaffold(realScaffoldView{}, opts)
 	}
 
-	return scaffoldNode(opts, "")
+	return scaffold(realScaffoldView{}, opts)
+}
+
+// executeDryRun runs the identical scaffolding path against a recording view,
+// then prints the plan. Validation errors (invalid nesting, missing parent
+// metadata, ...) surface exactly as they would in a real run: when nothing
+// was planned yet the error is returned bare; when the run stopped partway
+// (e.g. a node colliding without --force) the partial plan is still reported
+// so the user sees what a real run would have written before failing, and the
+// same error is returned.
+func executeDryRun(opts ScaffoldOptions) error {
+	dry := newDryRunScaffoldView()
+	err := scaffold(dry, opts)
+	plan := dry.plan
+	if err != nil && plan.isEmpty() {
+		// The run failed before planning any effect — report the validation
+		// error itself, exactly as a real run would.
+		return err
+	}
+
+	planErr := printScaffoldPlan(plan, opts.Force)
+	if planErr != nil {
+		err = planErr
+	}
+	printScaffoldPlanVerbose(plan)
+
+	if err != nil {
+		utils.Log.Warnf("Dry run — no files were created. Fix the reported error and re-run.")
+		return err
+	}
+	return nil
 }
 
 func makeSubCmd(kind string) *cobra.Command {
@@ -162,6 +211,7 @@ func init() {
 	createCmd.Flags().StringVar(&createAcademyFlags.ID, "id", "", "Content ID for Instructor Console")
 	createCmd.Flags().StringVar(&createAcademyFlags.Banner, "banner", "", "Banner image filename placed in the same directory")
 	createCmd.Flags().BoolVar(&createAcademyFlags.Draft, "draft", false, "Mark the content as draft (not published)")
+	createCmd.Flags().BoolVar(&createAcademyFlags.DryRun, "dry-run", false, "Preview what would be scaffolded without creating, modifying, or deleting any files")
 	createCmd.Flags().BoolVarP(&createAcademyFlags.Force, "force", "f", false, "Overwrite existing files")
 
 	subcommands := []string{string(Course), string(Module), string(Page), string(Lab), string(Test), string(Exam)}
@@ -174,6 +224,7 @@ func init() {
 		subCmd.Flags().StringVar(&createAcademyFlags.Tags, "tags", "", "Comma-separated list of tags")
 		subCmd.Flags().StringVar(&createAcademyFlags.Banner, "banner", "", "Banner image filename placed in the same directory")
 		subCmd.Flags().BoolVar(&createAcademyFlags.Draft, "draft", false, "Mark the content as draft (not published)")
+		subCmd.Flags().BoolVar(&createAcademyFlags.DryRun, "dry-run", false, "Preview what would be scaffolded without creating, modifying, or deleting any files")
 		subCmd.Flags().BoolVarP(&createAcademyFlags.Force, "force", "f", false, "Overwrite existing files")
 		createCmd.AddCommand(subCmd)
 	}

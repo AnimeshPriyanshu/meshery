@@ -74,17 +74,84 @@ func extractWeight(content []byte) int {
 	return 0
 }
 
-func inferWeight(parentDir, excludeDir string) int {
-	entries, err := os.ReadDir(parentDir)
+// dirEntry is the view-level projection of os.DirEntry needed by inferWeight.
+type dirEntry struct {
+	name  string
+	isDir bool
+}
+
+// scaffoldView abstracts every filesystem effect of scaffolding so a single
+// code path serves both create modes: realScaffoldView applies effects to disk
+// (normal create), dryRunScaffoldView records them without touching the
+// filesystem (--dry-run). Reads consult the recorded plan first, so nodes
+// scaffolded later in the same run observe earlier ones exactly as they would
+// on disk — e.g. checkNesting validating a child against a parent _index.md
+// written moments before, or weight inference counting a sibling created
+// earlier in the same tree.
+type scaffoldView interface {
+	// mkdirAll creates path and its parents (os.MkdirAll semantics).
+	mkdirAll(path string) error
+	// stat returns nil when path exists (on disk or planned), the stat error otherwise.
+	stat(path string) error
+	readFile(path string) ([]byte, error)
+	readDir(path string) ([]dirEntry, error)
+	// create truncating-writes content to path (os.Create semantics).
+	create(path string, content []byte) error
+}
+
+// realScaffoldView applies scaffolding effects to the real filesystem.
+type realScaffoldView struct{}
+
+func (realScaffoldView) mkdirAll(path string) error {
+	return os.MkdirAll(path, 0755)
+}
+
+func (realScaffoldView) stat(path string) error {
+	_, err := os.Stat(path)
+	return err
+}
+
+func (realScaffoldView) readFile(path string) ([]byte, error) {
+	return os.ReadFile(path)
+}
+
+func (realScaffoldView) readDir(path string) ([]dirEntry, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]dirEntry, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, dirEntry{name: entry.Name(), isDir: entry.IsDir()})
+	}
+	return out, nil
+}
+
+func (realScaffoldView) create(path string, content []byte) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			utils.Log.Errorf("failed to close file %s: %v", path, cerr)
+		}
+	}()
+	_, err = f.Write(content)
+	return err
+}
+
+func inferWeight(v scaffoldView, parentDir, excludeDir string) int {
+	entries, err := v.readDir(parentDir)
 	if err != nil {
 		return 1
 	}
 
 	maxWeight := 0
 	for _, entry := range entries {
-		if entry.IsDir() && entry.Name() != excludeDir {
-			indexPath := filepath.Join(parentDir, entry.Name(), "_index.md")
-			content, err := os.ReadFile(indexPath)
+		if entry.isDir && entry.name != excludeDir {
+			indexPath := filepath.Join(parentDir, entry.name, "_index.md")
+			content, err := v.readFile(indexPath)
 			if err == nil {
 				weight := extractWeight(content)
 				if weight > maxWeight {
@@ -124,10 +191,10 @@ func isRootType(cType string) bool {
 	return cType == string(academyModel.LearningPath) || cType == string(academyModel.Certification) || cType == string(academyModel.Challenge)
 }
 
-func checkNesting(cType string, parentDir string) (ParentFrontmatter, error) {
+func checkNesting(v scaffoldView, cType string, parentDir string) (ParentFrontmatter, error) {
 	var pf ParentFrontmatter
 	indexPath := filepath.Join(parentDir, "_index.md")
-	content, err := os.ReadFile(indexPath)
+	content, err := v.readFile(indexPath)
 	if err != nil {
 		if isRootType(cType) {
 			return pf, nil
@@ -182,10 +249,26 @@ type ScaffoldOptions struct {
 	ID          string
 	Banner      string
 	Draft       bool
+	DryRun      bool
 	SkipNesting bool
 }
 
-func scaffoldNode(opts ScaffoldOptions, explicitFolderName string) error {
+// scaffold dispatches to the scaffolding routine for the requested content
+// type, routing every filesystem effect through v.
+func scaffold(v scaffoldView, opts ScaffoldOptions) error {
+	// Root types (learning-path, certification) scaffold a full starter tree; challenge
+	// has its own lab/exam/content shape. Structural nodes (course, module, page, etc.)
+	// add a single node into the existing tree at --into.
+	if opts.Type == academyModel.Challenge {
+		return scaffoldChallenge(v, opts)
+	}
+	if isRootType(string(opts.Type)) {
+		return scaffoldTree(v, opts)
+	}
+	return scaffoldNode(v, opts, "")
+}
+
+func scaffoldNode(v scaffoldView, opts ScaffoldOptions, explicitFolderName string) error {
 	tmplStr := getTemplateString(string(opts.Type))
 	if tmplStr == "" {
 		return errTaxonomyType(string(opts.Type))
@@ -194,7 +277,7 @@ func scaffoldNode(opts ScaffoldOptions, explicitFolderName string) error {
 	var pf ParentFrontmatter
 	if !opts.SkipNesting {
 		var err error
-		pf, err = checkNesting(string(opts.Type), opts.TargetDir)
+		pf, err = checkNesting(v, string(opts.Type), opts.TargetDir)
 		if err != nil {
 			return err
 		}
@@ -235,7 +318,7 @@ func scaffoldNode(opts ScaffoldOptions, explicitFolderName string) error {
 			found := false
 			for testNum := 1; testNum <= maxTests; testNum++ {
 				testFolderName := fmt.Sprintf("test-%d", testNum)
-				_, statErr := os.Stat(filepath.Join(opts.TargetDir, testFolderName))
+				statErr := v.stat(filepath.Join(opts.TargetDir, testFolderName))
 				if statErr == nil {
 					continue
 				}
@@ -252,7 +335,7 @@ func scaffoldNode(opts ScaffoldOptions, explicitFolderName string) error {
 		}
 
 		nodeDir := filepath.Join(opts.TargetDir, folderName)
-		if err := os.MkdirAll(nodeDir, 0755); err != nil {
+		if err := v.mkdirAll(nodeDir); err != nil {
 			return err
 		}
 		indexPath = filepath.Join(nodeDir, "_index.md")
@@ -261,7 +344,7 @@ func scaffoldNode(opts ScaffoldOptions, explicitFolderName string) error {
 		return errScaffoldExists(indexPath)
 	}
 
-	weight := inferWeight(opts.TargetDir, folderName)
+	weight := inferWeight(v, opts.TargetDir, folderName)
 
 	tmpl, err := template.New(string(opts.Type)).Funcs(template.FuncMap{
 		"yamlQuote": strconv.Quote,
@@ -291,25 +374,22 @@ func scaffoldNode(opts ScaffoldOptions, explicitFolderName string) error {
 		Draft:    opts.Draft,
 	}
 
-	f, err := os.Create(indexPath)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if cerr := f.Close(); cerr != nil {
-			utils.Log.Errorf("failed to close file %s: %v", indexPath, cerr)
-		}
-	}()
-
-	if err := tmpl.Execute(f, data); err != nil {
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
 		return err
 	}
 
-	utils.Log.Infof("Scaffolded %s '%s' at %s", opts.Type, opts.Title, indexPath)
+	if err := v.create(indexPath, buf.Bytes()); err != nil {
+		return err
+	}
+
+	if !opts.DryRun {
+		utils.Log.Infof("Scaffolded %s '%s' at %s", opts.Type, opts.Title, indexPath)
+	}
 	return nil
 }
 
-func scaffoldChild(opts ScaffoldOptions, cType academyModel.ContentType, title, into string) (string, error) {
+func scaffoldChild(v scaffoldView, opts ScaffoldOptions, cType academyModel.ContentType, title, into string) (string, error) {
 	child := opts
 	child.Type = cType
 	child.Title = title
@@ -321,7 +401,7 @@ func scaffoldChild(opts ScaffoldOptions, cType academyModel.ContentType, title, 
 	child.Banner = ""
 	child.TargetDir = into
 
-	if err := scaffoldNode(child, ""); err != nil {
+	if err := scaffoldNode(v, child, ""); err != nil {
 		return "", err
 	}
 
@@ -333,14 +413,14 @@ func scaffoldChild(opts ScaffoldOptions, cType academyModel.ContentType, title, 
 	return filepath.Join(into, slug), nil
 }
 
-func scaffoldTree(opts ScaffoldOptions) error {
+func scaffoldTree(v scaffoldView, opts ScaffoldOptions) error {
 	folderName, err := makeSlug(opts.Title)
 	if err != nil {
 		return err
 	}
 	baseDir := filepath.Join(opts.TargetDir, folderName)
 
-	err = scaffoldNode(opts, folderName)
+	err = scaffoldNode(v, opts, folderName)
 	if err != nil {
 		return err
 	}
@@ -350,22 +430,22 @@ func scaffoldTree(opts ScaffoldOptions) error {
 	// Only root types reach scaffoldTree: learning-path builds a course/module/page
 	// starter tree; certification builds an exam.
 	if opts.Type == academyModel.LearningPath {
-		currentDir, err = scaffoldChild(opts, Course, "Course 1", currentDir)
+		currentDir, err = scaffoldChild(v, opts, Course, "Course 1", currentDir)
 		if err != nil {
 			return err
 		}
-		currentDir, err = scaffoldChild(opts, Module, "Module 1", currentDir)
+		currentDir, err = scaffoldChild(v, opts, Module, "Module 1", currentDir)
 		if err != nil {
 			return err
 		}
-		_, err = scaffoldChild(opts, Page, "Page 1", currentDir)
+		_, err = scaffoldChild(v, opts, Page, "Page 1", currentDir)
 		if err != nil {
 			return err
 		}
 	}
 
 	if opts.Type == academyModel.Certification {
-		_, err = scaffoldChild(opts, Exam, "Exam 1", currentDir)
+		_, err = scaffoldChild(v, opts, Exam, "Exam 1", currentDir)
 		if err != nil {
 			return err
 		}
@@ -374,26 +454,26 @@ func scaffoldTree(opts ScaffoldOptions) error {
 	return nil
 }
 
-func scaffoldChallenge(opts ScaffoldOptions) error {
+func scaffoldChallenge(v scaffoldView, opts ScaffoldOptions) error {
 	folderName, err := makeSlug(opts.Title)
 	if err != nil {
 		return err
 	}
 	baseDir := filepath.Join(opts.TargetDir, folderName)
 
-	err = scaffoldNode(opts, folderName)
+	err = scaffoldNode(v, opts, folderName)
 	if err != nil {
 		return err
 	}
 
 	currentDir := baseDir
 
-	_, err = scaffoldChild(opts, Lab, "Lab", currentDir)
+	_, err = scaffoldChild(v, opts, Lab, "Lab", currentDir)
 	if err != nil {
 		return err
 	}
 
-	_, err = scaffoldChild(opts, Exam, "Exam", currentDir)
+	_, err = scaffoldChild(v, opts, Exam, "Exam", currentDir)
 	if err != nil {
 		return err
 	}
@@ -417,7 +497,7 @@ func scaffoldChallenge(opts ScaffoldOptions) error {
 		pageOpts.TargetDir = filepath.Join(currentDir, "content")
 		pageOpts.ID = ""
 		pageOpts.SkipNesting = true
-		err = scaffoldNode(pageOpts, dir.name)
+		err = scaffoldNode(v, pageOpts, dir.name)
 		if err != nil {
 			return err
 		}
